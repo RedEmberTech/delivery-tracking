@@ -83,49 +83,46 @@ jobs:
 
           // ─── Helpers ───
 
-          // Find the current sprint
           const today = new Date().toISOString().split('T')[0];
           const sprintItems = items.filter(item => {
             const sprint = item.sprint;
             if (!sprint) return false;
-            const startDate = sprint.startDate;
-            const endDate = new Date(startDate);
-            endDate.setDate(endDate.getDate() + (sprint.duration || 14));
-            return startDate <= today && endDate.toISOString().split('T')[0] >= today;
+            const start = sprint.startDate;
+            const end = new Date(start);
+            end.setDate(end.getDate() + (sprint.duration || 14));
+            return start <= today && end.toISOString().split('T')[0] >= today;
           });
 
-          const currentSprintTitle = sprintItems.length > 0 ? sprintItems[0].sprint.title : 'Current Sprint';
-          const sprintStart = sprintItems.length > 0 ? sprintItems[0].sprint.startDate : '';
-          const sprintDuration = sprintItems.length > 0 ? sprintItems[0].sprint.duration : 14;
-          const endDate = sprintStart ? new Date(new Date(sprintStart).getTime() + sprintDuration * 86400000).toISOString().split('T')[0] : '';
+          const currentSprintTitle = sprintItems[0]?.sprint.title || 'Current Sprint';
+          const sprintStart = sprintItems[0]?.sprint.startDate || '';
+          const sprintDuration = sprintItems[0]?.sprint.duration || 14;
+          const sprintEnd = sprintStart
+            ? new Date(new Date(sprintStart).getTime() + sprintDuration * 86400000).toISOString().split('T')[0]
+            : '';
 
           const date = new Date().toLocaleDateString('en-ZA', {
             weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
             timeZone: 'Africa/Johannesburg'
           });
 
-          // ─── Group by Client ───
-          const clientGroups = {};
-          const assigneeLoad = {};
           const statusEmoji = {
             'Done': '✅', 'In Progress': '🔄', 'UAT': '🧪', 'PROD': '🚀',
             'Todo': '📥', 'On Hold': '⏸️', 'Blocked': '🔴', 'Backlog': '📋', 'In Review': '🔍'
           };
-          const statusColor = {
-            'Done': 'Good', 'In Progress': 'Accent', 'UAT': 'Warning',
-            'PROD': 'Good', 'Blocked': 'Attention', 'On Hold': 'Warning'
-          };
+
+          // ─── Group by Client ───
+          const clientGroups = {};
+          const assigneeLoad = {};
 
           sprintItems.forEach(item => {
-            const status = item.fieldValueByName?.name || 'No Status';
-            const title = item.content?.title || 'Untitled';
+            const status  = item.fieldValueByName?.name || 'No Status';
+            const title   = item.content?.title || 'Untitled';
             const priority = item.priority?.name || '';
-            const client = item.client?.name || 'Internal / Unassigned';
+            const client  = item.client?.name || 'Internal';
             const assignees = (item.content?.assignees?.nodes || []).map(a => a.login);
-            const url = item.content?.url || '';
 
             if (!clientGroups[client]) clientGroups[client] = [];
-            clientGroups[client].push({ title, status, priority, assignees, url });
+            clientGroups[client].push({ title, status, priority, assignees });
 
             assignees.forEach(a => {
               if (!assigneeLoad[a]) assigneeLoad[a] = { total: 0, statuses: {} };
@@ -134,10 +131,29 @@ jobs:
             });
           });
 
-          // ─── Build Adaptive Card Body ───
+          // Sort clients — most active first
+          const clientOrder = Object.entries(clientGroups).sort((a, b) => {
+            const score = items => items.filter(i => !['Done','Backlog'].includes(i.status)).length;
+            return score(b[1]) - score(a[1]);
+          });
+
+          // ─── Status summary counts ───
+          const statusCounts = {};
+          sprintItems.forEach(i => {
+            const s = i.fieldValueByName?.name || 'No Status';
+            statusCounts[s] = (statusCounts[s] || 0) + 1;
+          });
+
+          const statusOrder = ['In Progress','Blocked','UAT','PROD','In Review','Todo','On Hold','Backlog','Done'];
+          const summaryParts = statusOrder
+            .filter(s => statusCounts[s])
+            .map(s => `${statusEmoji[s]} **${statusCounts[s]}** ${s}`)
+            .join('   ');
+
+          // ─── Build Card Body ───
           const cardBody = [];
 
-          // Header
+          // Title
           cardBody.push({
             type: "TextBlock",
             text: `📋 Client Delivery Tracker — ${currentSprintTitle}`,
@@ -148,72 +164,59 @@ jobs:
 
           cardBody.push({
             type: "TextBlock",
-            text: `${date}  •  Sprint: ${sprintStart} → ${endDate}  •  ${sprintItems.length} items`,
+            text: `${date}  •  ${sprintStart} → ${sprintEnd}  •  ${sprintItems.length} items`,
             spacing: "Small",
             isSubtle: true,
             wrap: true
           });
 
-          // Summary counters row
-          const statusCounts = {};
-          sprintItems.forEach(item => {
-            const s = item.fieldValueByName?.name || 'No Status';
-            statusCounts[s] = (statusCounts[s] || 0) + 1;
-          });
-
-          const counterColumns = Object.entries(statusCounts).map(([status, count]) => ({
-            type: "Column",
-            width: "auto",
-            items: [{
-              type: "TextBlock",
-              text: `${statusEmoji[status] || '•'} ${count}`,
-              weight: "Bolder",
-              horizontalAlignment: "Center"
-            }, {
-              type: "TextBlock",
-              text: status,
-              size: "Small",
-              isSubtle: true,
-              horizontalAlignment: "Center",
-              spacing: "None"
-            }]
-          }));
-
+          // Status summary bar
           cardBody.push({
-            type: "ColumnSet",
-            columns: counterColumns,
+            type: "TextBlock",
+            text: summaryParts,
+            wrap: true,
             separator: true,
             spacing: "Medium"
           });
 
-          // ─── Client Sections ───
-          // Sort clients: ones with critical/in-progress items first
-          const clientOrder = Object.entries(clientGroups).sort((a, b) => {
-            const aActive = a[1].filter(i => !['Done', 'Backlog'].includes(i.status)).length;
-            const bActive = b[1].filter(i => !['Done', 'Backlog'].includes(i.status)).length;
-            return bActive - aActive;
-          });
-
-          clientOrder.forEach(([client, items]) => {
-            // Client header container
+          // ─── Per-Client Table ───
+          clientOrder.forEach(([client, clientItems]) => {
+            // Client name as bold header
             cardBody.push({
-              type: "Container",
+              type: "TextBlock",
+              text: `**${client}**`,
+              weight: "Bolder",
+              size: "Medium",
+              color: "Accent",
               separator: true,
               spacing: "Medium",
-              items: [{
-                type: "TextBlock",
-                text: `🏢 ${client}`,
-                weight: "Bolder",
-                size: "Medium",
-                wrap: true
-              }]
+              wrap: true
             });
 
-            // Items as a table-like layout
-            items.forEach(item => {
+            // Column header row
+            cardBody.push({
+              type: "ColumnSet",
+              spacing: "Small",
+              columns: [
+                { type: "Column", width: "stretch",
+                  items: [{ type: "TextBlock", text: "Task", weight: "Bolder", size: "Small", isSubtle: true }]
+                },
+                { type: "Column", width: "100px",
+                  items: [{ type: "TextBlock", text: "Status", weight: "Bolder", size: "Small", isSubtle: true }]
+                },
+                { type: "Column", width: "120px",
+                  items: [{ type: "TextBlock", text: "Who", weight: "Bolder", size: "Small", isSubtle: true }]
+                }
+              ]
+            });
+
+            // One row per task
+            clientItems.forEach(item => {
               const emoji = statusEmoji[item.status] || '•';
-              const priorityBadge = item.priority ? ` \`${item.priority}\`` : '';
-              const assigneeText = item.assignees.length > 0 ? item.assignees.join(', ') : 'Unassigned';
+              const who = item.assignees.length > 0
+                ? item.assignees.map(a => a.replace(/-RedEmber|-hub/gi, '')).join(', ')
+                : 'Unassigned';
+              const priorityTag = item.priority.includes('P1') ? ' 🔴' : item.priority.includes('P2') ? ' 🟡' : '';
 
               cardBody.push({
                 type: "ColumnSet",
@@ -221,98 +224,85 @@ jobs:
                 columns: [
                   {
                     type: "Column",
-                    width: "auto",
-                    items: [{ type: "TextBlock", text: emoji, size: "Default" }]
+                    width: "stretch",
+                    items: [{
+                      type: "TextBlock",
+                      text: item.title.replace(/^[^\w\s]+/, '').trim() + priorityTag,
+                      size: "Small",
+                      wrap: true
+                    }]
                   },
                   {
                     type: "Column",
-                    width: "stretch",
-                    items: [
-                      {
-                        type: "TextBlock",
-                        text: item.title + priorityBadge,
-                        wrap: true,
-                        weight: "Bolder",
-                        size: "Small"
-                      },
-                      {
-                        type: "TextBlock",
-                        text: `${item.status}  •  ${assigneeText}`,
-                        spacing: "None",
-                        isSubtle: true,
-                        size: "Small",
-                        wrap: true
-                      }
-                    ]
+                    width: "100px",
+                    items: [{
+                      type: "TextBlock",
+                      text: `${emoji} ${item.status}`,
+                      size: "Small",
+                      wrap: true
+                    }]
+                  },
+                  {
+                    type: "Column",
+                    width: "120px",
+                    items: [{
+                      type: "TextBlock",
+                      text: who,
+                      size: "Small",
+                      isSubtle: true,
+                      wrap: true
+                    }]
                   }
                 ]
               });
             });
           });
 
-          // ─── Team Load Section ───
+          // ─── Team Load ───
           cardBody.push({
-            type: "Container",
+            type: "TextBlock",
+            text: "👥 Team Load",
+            weight: "Bolder",
+            size: "Medium",
             separator: true,
-            spacing: "Medium",
-            items: [{
-              type: "TextBlock",
-              text: "👥 Team Load",
-              weight: "Bolder",
-              size: "Medium"
-            }]
+            spacing: "Medium"
           });
 
           const teamFacts = Object.entries(assigneeLoad)
             .sort((a, b) => b[1].total - a[1].total)
             .map(([name, data]) => {
-              const statusSummary = Object.entries(data.statuses)
-                .map(([s, c]) => `${statusEmoji[s] || ''} ${c} ${s.toLowerCase()}`)
-                .join('  ');
-              return { title: name, value: `${data.total} items — ${statusSummary}` };
+              const shortName = name.replace(/-RedEmber|-hub/gi, '');
+              const breakdown = Object.entries(data.statuses)
+                .map(([s, c]) => `${statusEmoji[s] || ''} ${c} ${s}`).join('  ');
+              return { title: shortName, value: `${data.total} items — ${breakdown}` };
             });
 
-          cardBody.push({
-            type: "FactSet",
-            facts: teamFacts,
-            spacing: "Small"
-          });
+          cardBody.push({ type: "FactSet", facts: teamFacts, spacing: "Small" });
 
-          // ─── Attention Section ───
-          const critical = sprintItems.filter(item => {
-            const p = item.priority?.name || '';
-            const s = item.fieldValueByName?.name || '';
-            return p.includes('P1') && s !== 'Done';
-          });
+          // ─── Attention Banner ───
+          const critical = sprintItems.filter(i =>
+            (i.priority?.name || '').includes('P1') && i.fieldValueByName?.name !== 'Done'
+          );
           const blocked = sprintItems.filter(i => i.fieldValueByName?.name === 'Blocked');
-          const onHold = sprintItems.filter(i => i.fieldValueByName?.name === 'On Hold');
+          const onHold  = sprintItems.filter(i => i.fieldValueByName?.name === 'On Hold');
 
-          if (critical.length > 0 || blocked.length > 0 || onHold.length > 0) {
-            const warnings = [];
-            if (critical.length > 0) warnings.push(`🔴 ${critical.length}x P1 Critical still active`);
-            if (blocked.length > 0) warnings.push(`🚫 ${blocked.length} items Blocked`);
-            if (onHold.length > 0) warnings.push(`⏸️ ${onHold.length} items On Hold — need decisions`);
+          if (critical.length || blocked.length || onHold.length) {
+            const warnings = [
+              critical.length && `🔴 ${critical.length}x P1 Critical still active`,
+              blocked.length  && `🚫 ${blocked.length} Blocked — needs unblocking`,
+              onHold.length   && `⏸️ ${onHold.length} On Hold — needs decisions`
+            ].filter(Boolean).join('   ');
 
             cardBody.push({
               type: "Container",
+              style: "attention",
               separator: true,
               spacing: "Medium",
-              style: "attention",
-              items: [{
-                type: "TextBlock",
-                text: "⚠️ Needs Attention",
-                weight: "Bolder",
-                size: "Medium"
-              }, {
-                type: "TextBlock",
-                text: warnings.join('\n\n'),
-                wrap: true,
-                size: "Small"
-              }]
+              items: [{ type: "TextBlock", text: `⚠️  ${warnings}`, wrap: true, size: "Small" }]
             });
           }
 
-          // ─── Build Payload ───
+          // ─── Payload ───
           const payload = JSON.stringify({
             type: "message",
             attachments: [{
@@ -342,10 +332,10 @@ jobs:
 
           const req = https.request(options, (res) => {
             let body = '';
-            res.on('data', (chunk) => body += chunk);
+            res.on('data', chunk => body += chunk);
             res.on('end', () => {
               if (res.statusCode >= 200 && res.statusCode < 300) {
-                console.log('✅ Posted to Teams via Workflow');
+                console.log('✅ Posted to Teams');
               } else {
                 console.error(`❌ Teams responded ${res.statusCode}: ${body}`);
                 process.exit(1);
@@ -353,11 +343,7 @@ jobs:
             });
           });
 
-          req.on('error', (e) => {
-            console.error(`❌ Failed: ${e.message}`);
-            process.exit(1);
-          });
-
+          req.on('error', e => { console.error(`❌ ${e.message}`); process.exit(1); });
           req.write(payload);
           req.end();
           EOF

@@ -1,0 +1,249 @@
+name: Daily Sprint Status to Teams
+
+on:
+  schedule:
+    # 5pm SAST (UTC+2) = 15:00 UTC, Monday to Friday
+    - cron: '0 15 * * 1-5'
+  workflow_dispatch: # Allow manual trigger for testing
+
+jobs:
+  post-status:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+
+    steps:
+      - name: Query Client Delivery Tracker
+        id: query
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_READ_TOKEN }}
+        run: |
+          # Get the current active sprint iteration and all items from Project #8
+          RESULT=$(gh api graphql -f query='
+            query {
+              organization(login: "RedEmberTech") {
+                projectV2(number: 8) {
+                  title
+                  items(first: 100) {
+                    nodes {
+                      fieldValueByName(name: "Status") {
+                        ... on ProjectV2ItemFieldSingleSelectValue {
+                          name
+                        }
+                      }
+                      sprint: fieldValueByName(name: "Sprint") {
+                        ... on ProjectV2ItemFieldIterationValue {
+                          title
+                          startDate
+                          duration
+                        }
+                      }
+                      priority: fieldValueByName(name: "Priority") {
+                        ... on ProjectV2ItemFieldSingleSelectValue {
+                          name
+                        }
+                      }
+                      client: fieldValueByName(name: "Client") {
+                        ... on ProjectV2ItemFieldSingleSelectValue {
+                          name
+                        }
+                      }
+                      content {
+                        ... on Issue {
+                          title
+                          number
+                          url
+                          assignees(first: 5) {
+                            nodes {
+                              login
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          ')
+          echo "$RESULT" > /tmp/project_data.json
+
+      - name: Format and Post to Teams
+        env:
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+        run: |
+          node << 'EOF'
+          const fs = require('fs');
+          const https = require('https');
+          const { URL } = require('url');
+
+          const raw = JSON.parse(fs.readFileSync('/tmp/project_data.json', 'utf8'));
+          const items = raw.data.organization.projectV2.items.nodes;
+
+          // Find the current sprint (most recent start date that's not in the future)
+          const today = new Date().toISOString().split('T')[0];
+          const sprintItems = items.filter(item => {
+            const sprint = item.sprint;
+            if (!sprint) return false;
+            const startDate = sprint.startDate;
+            const endDate = new Date(startDate);
+            endDate.setDate(endDate.getDate() + (sprint.duration || 14));
+            return startDate <= today && endDate.toISOString().split('T')[0] >= today;
+          });
+
+          const currentSprintTitle = sprintItems.length > 0 ? sprintItems[0].sprint.title : 'Current Sprint';
+          const sprintStart = sprintItems.length > 0 ? sprintItems[0].sprint.startDate : '';
+          const sprintDuration = sprintItems.length > 0 ? sprintItems[0].sprint.duration : 14;
+          const endDate = sprintStart ? new Date(new Date(sprintStart).getTime() + sprintDuration * 86400000).toISOString().split('T')[0] : '';
+
+          // Group by status
+          const statusGroups = {};
+          const assigneeLoad = {};
+
+          sprintItems.forEach(item => {
+            const status = item.fieldValueByName?.name || 'No Status';
+            const title = item.content?.title || 'Untitled';
+            const priority = item.priority?.name || '';
+            const client = item.client?.name || '';
+            const assignees = (item.content?.assignees?.nodes || []).map(a => a.login);
+            const url = item.content?.url || '';
+
+            if (!statusGroups[status]) statusGroups[status] = [];
+            statusGroups[status].push({ title, priority, client, assignees, url });
+
+            assignees.forEach(a => {
+              if (!assigneeLoad[a]) assigneeLoad[a] = { total: 0, statuses: {} };
+              assigneeLoad[a].total++;
+              assigneeLoad[a].statuses[status] = (assigneeLoad[a].statuses[status] || 0) + 1;
+            });
+          });
+
+          // Build the message
+          const statusEmoji = {
+            'Done': '✅',
+            'In Progress': '🔄',
+            'UAT': '🧪',
+            'PROD': '🚀',
+            'Todo': '📥',
+            'On Hold': '⏸️',
+            'Blocked': '🔴',
+            'Backlog': '📋',
+            'In Review': '🔍'
+          };
+
+          const statusOrder = ['In Progress', 'Blocked', 'UAT', 'PROD', 'Todo', 'On Hold', 'Backlog', 'Done'];
+
+          const date = new Date().toLocaleDateString('en-ZA', { 
+            weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+            timeZone: 'Africa/Johannesburg'
+          });
+
+          let message = `📋 **Client Delivery Tracker — ${currentSprintTitle}**\n`;
+          message += `📅 ${date} | Sprint: ${sprintStart} → ${endDate} | Items: ${sprintItems.length}\n`;
+          message += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+          // Status sections
+          statusOrder.forEach(status => {
+            const group = statusGroups[status];
+            if (!group || group.length === 0) return;
+
+            const emoji = statusEmoji[status] || '•';
+            message += `${emoji} **${status} (${group.length})**\n`;
+
+            group.forEach(item => {
+              const parts = [`• ${item.title}`];
+              if (item.client) parts.push(`— ${item.client}`);
+              if (item.priority) parts.push(`[${item.priority}]`);
+              if (item.assignees.length > 0) parts.push(`— @${item.assignees.join(' @')}`);
+              message += parts.join(' ') + '\n';
+            });
+            message += '\n';
+          });
+
+          // Team load summary
+          message += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+          message += `👥 **Team Load:**\n`;
+          Object.entries(assigneeLoad)
+            .sort((a, b) => b[1].total - a[1].total)
+            .forEach(([name, data]) => {
+              const statusSummary = Object.entries(data.statuses)
+                .map(([s, c]) => `${c} ${s.toLowerCase()}`)
+                .join(', ');
+              message += `• ${name} — ${data.total} items (${statusSummary})\n`;
+            });
+
+          // Attention section
+          const critical = sprintItems.filter(item => {
+            const p = item.priority?.name || '';
+            const s = item.fieldValueByName?.name || '';
+            return p.includes('P1') && s !== 'Done';
+          });
+
+          const blocked = statusGroups['Blocked'] || [];
+          const onHold = statusGroups['On Hold'] || [];
+
+          if (critical.length > 0 || blocked.length > 0 || onHold.length > 0) {
+            message += `\n⚠️ **Attention:**\n`;
+            if (critical.length > 0) message += `• ${critical.length}x P1 Critical items still active\n`;
+            if (blocked.length > 0) message += `• ${blocked.length} items Blocked — need unblocking\n`;
+            if (onHold.length > 0) message += `• ${onHold.length} items On Hold — need decisions\n`;
+          }
+
+          message += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+
+          // Adaptive Card payload for Teams
+          const payload = JSON.stringify({
+            type: "message",
+            attachments: [{
+              contentType: "application/vnd.microsoft.card.adaptive",
+              contentUrl: null,
+              content: {
+                "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                type: "AdaptiveCard",
+                version: "1.4",
+                body: [
+                  {
+                    type: "TextBlock",
+                    text: message,
+                    wrap: true,
+                    size: "small"
+                  }
+                ]
+              }
+            }]
+          });
+
+          // Post to Teams webhook
+          const webhookUrl = new URL(process.env.TEAMS_WEBHOOK_URL);
+          const options = {
+            hostname: webhookUrl.hostname,
+            path: webhookUrl.pathname + webhookUrl.search,
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Content-Length': Buffer.byteLength(payload)
+            }
+          };
+
+          const req = https.request(options, (res) => {
+            let body = '';
+            res.on('data', (chunk) => body += chunk);
+            res.on('end', () => {
+              if (res.statusCode === 200 || res.statusCode === 202) {
+                console.log('✅ Successfully posted to Teams');
+              } else {
+                console.error(`❌ Teams responded with ${res.statusCode}: ${body}`);
+                process.exit(1);
+              }
+            });
+          });
+
+          req.on('error', (e) => {
+            console.error(`❌ Failed to post to Teams: ${e.message}`);
+            process.exit(1);
+          });
+
+          req.write(payload);
+          req.end();
+          EOF

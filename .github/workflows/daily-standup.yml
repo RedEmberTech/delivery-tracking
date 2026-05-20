@@ -192,7 +192,8 @@ jobs:
 
           message += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
 
-          // Adaptive Card payload for Teams
+          // Adaptive Card payload for Teams Workflow (Power Automate)
+          // This format is required by "Post to a channel when a webhook request is received"
           const payload = JSON.stringify({
             type: "message",
             attachments: [{
@@ -205,19 +206,35 @@ jobs:
                 body: [
                   {
                     type: "TextBlock",
+                    text: "📋 Client Delivery Tracker — " + currentSprintTitle,
+                    weight: "Bolder",
+                    size: "Large",
+                    wrap: true
+                  },
+                  {
+                    type: "TextBlock",
+                    text: `📅 ${date} | Sprint: ${sprintStart} → ${endDate} | Items: ${sprintItems.length}`,
+                    spacing: "None",
+                    isSubtle: true,
+                    wrap: true
+                  },
+                  {
+                    type: "TextBlock",
                     text: message,
                     wrap: true,
-                    size: "small"
+                    size: "Small",
+                    separator: true
                   }
                 ]
               }
             }]
           });
 
-          // Post to Teams webhook
+          // Post to Teams Workflow webhook (Power Automate)
           const webhookUrl = new URL(process.env.TEAMS_WEBHOOK_URL);
           const options = {
             hostname: webhookUrl.hostname,
+            port: webhookUrl.port || 443,
             path: webhookUrl.pathname + webhookUrl.search,
             method: 'POST',
             headers: {
@@ -230,10 +247,10 @@ jobs:
             let body = '';
             res.on('data', (chunk) => body += chunk);
             res.on('end', () => {
-              if (res.statusCode === 200 || res.statusCode === 202) {
-                console.log('✅ Successfully posted to Teams');
+              if (res.statusCode >= 200 && res.statusCode < 300) {
+                console.log('✅ Successfully posted to Teams via Workflow');
               } else {
-                console.error(`❌ Teams responded with ${res.statusCode}: ${body}`);
+                console.error(`❌ Teams Workflow responded with ${res.statusCode}: ${body}`);
                 process.exit(1);
               }
             });

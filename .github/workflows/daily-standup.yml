@@ -81,7 +81,9 @@ jobs:
           const raw = JSON.parse(fs.readFileSync('/tmp/project_data.json', 'utf8'));
           const items = raw.data.organization.projectV2.items.nodes;
 
-          // Find the current sprint (most recent start date that's not in the future)
+          // ─── Helpers ───
+
+          // Find the current sprint
           const today = new Date().toISOString().split('T')[0];
           const sprintItems = items.filter(item => {
             const sprint = item.sprint;
@@ -97,20 +99,33 @@ jobs:
           const sprintDuration = sprintItems.length > 0 ? sprintItems[0].sprint.duration : 14;
           const endDate = sprintStart ? new Date(new Date(sprintStart).getTime() + sprintDuration * 86400000).toISOString().split('T')[0] : '';
 
-          // Group by status
-          const statusGroups = {};
+          const date = new Date().toLocaleDateString('en-ZA', {
+            weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+            timeZone: 'Africa/Johannesburg'
+          });
+
+          // ─── Group by Client ───
+          const clientGroups = {};
           const assigneeLoad = {};
+          const statusEmoji = {
+            'Done': '✅', 'In Progress': '🔄', 'UAT': '🧪', 'PROD': '🚀',
+            'Todo': '📥', 'On Hold': '⏸️', 'Blocked': '🔴', 'Backlog': '📋', 'In Review': '🔍'
+          };
+          const statusColor = {
+            'Done': 'Good', 'In Progress': 'Accent', 'UAT': 'Warning',
+            'PROD': 'Good', 'Blocked': 'Attention', 'On Hold': 'Warning'
+          };
 
           sprintItems.forEach(item => {
             const status = item.fieldValueByName?.name || 'No Status';
             const title = item.content?.title || 'Untitled';
             const priority = item.priority?.name || '';
-            const client = item.client?.name || '';
+            const client = item.client?.name || 'Internal / Unassigned';
             const assignees = (item.content?.assignees?.nodes || []).map(a => a.login);
             const url = item.content?.url || '';
 
-            if (!statusGroups[status]) statusGroups[status] = [];
-            statusGroups[status].push({ title, priority, client, assignees, url });
+            if (!clientGroups[client]) clientGroups[client] = [];
+            clientGroups[client].push({ title, status, priority, assignees, url });
 
             assignees.forEach(a => {
               if (!assigneeLoad[a]) assigneeLoad[a] = { total: 0, statuses: {} };
@@ -119,81 +134,185 @@ jobs:
             });
           });
 
-          // Build the message
-          const statusEmoji = {
-            'Done': '✅',
-            'In Progress': '🔄',
-            'UAT': '🧪',
-            'PROD': '🚀',
-            'Todo': '📥',
-            'On Hold': '⏸️',
-            'Blocked': '🔴',
-            'Backlog': '📋',
-            'In Review': '🔍'
-          };
+          // ─── Build Adaptive Card Body ───
+          const cardBody = [];
 
-          const statusOrder = ['In Progress', 'Blocked', 'UAT', 'PROD', 'Todo', 'On Hold', 'Backlog', 'Done'];
-
-          const date = new Date().toLocaleDateString('en-ZA', { 
-            weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
-            timeZone: 'Africa/Johannesburg'
+          // Header
+          cardBody.push({
+            type: "TextBlock",
+            text: `📋 Client Delivery Tracker — ${currentSprintTitle}`,
+            weight: "Bolder",
+            size: "Large",
+            wrap: true
           });
 
-          let message = `📋 **Client Delivery Tracker — ${currentSprintTitle}**\n`;
-          message += `📅 ${date} | Sprint: ${sprintStart} → ${endDate} | Items: ${sprintItems.length}\n`;
-          message += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+          cardBody.push({
+            type: "TextBlock",
+            text: `${date}  •  Sprint: ${sprintStart} → ${endDate}  •  ${sprintItems.length} items`,
+            spacing: "Small",
+            isSubtle: true,
+            wrap: true
+          });
 
-          // Status sections
-          statusOrder.forEach(status => {
-            const group = statusGroups[status];
-            if (!group || group.length === 0) return;
+          // Summary counters row
+          const statusCounts = {};
+          sprintItems.forEach(item => {
+            const s = item.fieldValueByName?.name || 'No Status';
+            statusCounts[s] = (statusCounts[s] || 0) + 1;
+          });
 
-            const emoji = statusEmoji[status] || '•';
-            message += `${emoji} **${status} (${group.length})**\n`;
+          const counterColumns = Object.entries(statusCounts).map(([status, count]) => ({
+            type: "Column",
+            width: "auto",
+            items: [{
+              type: "TextBlock",
+              text: `${statusEmoji[status] || '•'} ${count}`,
+              weight: "Bolder",
+              horizontalAlignment: "Center"
+            }, {
+              type: "TextBlock",
+              text: status,
+              size: "Small",
+              isSubtle: true,
+              horizontalAlignment: "Center",
+              spacing: "None"
+            }]
+          }));
 
-            group.forEach(item => {
-              const parts = [`• ${item.title}`];
-              if (item.client) parts.push(`— ${item.client}`);
-              if (item.priority) parts.push(`[${item.priority}]`);
-              if (item.assignees.length > 0) parts.push(`— @${item.assignees.join(' @')}`);
-              message += parts.join(' ') + '\n';
+          cardBody.push({
+            type: "ColumnSet",
+            columns: counterColumns,
+            separator: true,
+            spacing: "Medium"
+          });
+
+          // ─── Client Sections ───
+          // Sort clients: ones with critical/in-progress items first
+          const clientOrder = Object.entries(clientGroups).sort((a, b) => {
+            const aActive = a[1].filter(i => !['Done', 'Backlog'].includes(i.status)).length;
+            const bActive = b[1].filter(i => !['Done', 'Backlog'].includes(i.status)).length;
+            return bActive - aActive;
+          });
+
+          clientOrder.forEach(([client, items]) => {
+            // Client header container
+            cardBody.push({
+              type: "Container",
+              separator: true,
+              spacing: "Medium",
+              items: [{
+                type: "TextBlock",
+                text: `🏢 ${client}`,
+                weight: "Bolder",
+                size: "Medium",
+                wrap: true
+              }]
             });
-            message += '\n';
+
+            // Items as a table-like layout
+            items.forEach(item => {
+              const emoji = statusEmoji[item.status] || '•';
+              const priorityBadge = item.priority ? ` \`${item.priority}\`` : '';
+              const assigneeText = item.assignees.length > 0 ? item.assignees.join(', ') : 'Unassigned';
+
+              cardBody.push({
+                type: "ColumnSet",
+                spacing: "Small",
+                columns: [
+                  {
+                    type: "Column",
+                    width: "auto",
+                    items: [{ type: "TextBlock", text: emoji, size: "Default" }]
+                  },
+                  {
+                    type: "Column",
+                    width: "stretch",
+                    items: [
+                      {
+                        type: "TextBlock",
+                        text: item.title + priorityBadge,
+                        wrap: true,
+                        weight: "Bolder",
+                        size: "Small"
+                      },
+                      {
+                        type: "TextBlock",
+                        text: `${item.status}  •  ${assigneeText}`,
+                        spacing: "None",
+                        isSubtle: true,
+                        size: "Small",
+                        wrap: true
+                      }
+                    ]
+                  }
+                ]
+              });
+            });
           });
 
-          // Team load summary
-          message += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
-          message += `👥 **Team Load:**\n`;
-          Object.entries(assigneeLoad)
+          // ─── Team Load Section ───
+          cardBody.push({
+            type: "Container",
+            separator: true,
+            spacing: "Medium",
+            items: [{
+              type: "TextBlock",
+              text: "👥 Team Load",
+              weight: "Bolder",
+              size: "Medium"
+            }]
+          });
+
+          const teamFacts = Object.entries(assigneeLoad)
             .sort((a, b) => b[1].total - a[1].total)
-            .forEach(([name, data]) => {
+            .map(([name, data]) => {
               const statusSummary = Object.entries(data.statuses)
-                .map(([s, c]) => `${c} ${s.toLowerCase()}`)
-                .join(', ');
-              message += `• ${name} — ${data.total} items (${statusSummary})\n`;
+                .map(([s, c]) => `${statusEmoji[s] || ''} ${c} ${s.toLowerCase()}`)
+                .join('  ');
+              return { title: name, value: `${data.total} items — ${statusSummary}` };
             });
 
-          // Attention section
+          cardBody.push({
+            type: "FactSet",
+            facts: teamFacts,
+            spacing: "Small"
+          });
+
+          // ─── Attention Section ───
           const critical = sprintItems.filter(item => {
             const p = item.priority?.name || '';
             const s = item.fieldValueByName?.name || '';
             return p.includes('P1') && s !== 'Done';
           });
-
-          const blocked = statusGroups['Blocked'] || [];
-          const onHold = statusGroups['On Hold'] || [];
+          const blocked = sprintItems.filter(i => i.fieldValueByName?.name === 'Blocked');
+          const onHold = sprintItems.filter(i => i.fieldValueByName?.name === 'On Hold');
 
           if (critical.length > 0 || blocked.length > 0 || onHold.length > 0) {
-            message += `\n⚠️ **Attention:**\n`;
-            if (critical.length > 0) message += `• ${critical.length}x P1 Critical items still active\n`;
-            if (blocked.length > 0) message += `• ${blocked.length} items Blocked — need unblocking\n`;
-            if (onHold.length > 0) message += `• ${onHold.length} items On Hold — need decisions\n`;
+            const warnings = [];
+            if (critical.length > 0) warnings.push(`🔴 ${critical.length}x P1 Critical still active`);
+            if (blocked.length > 0) warnings.push(`🚫 ${blocked.length} items Blocked`);
+            if (onHold.length > 0) warnings.push(`⏸️ ${onHold.length} items On Hold — need decisions`);
+
+            cardBody.push({
+              type: "Container",
+              separator: true,
+              spacing: "Medium",
+              style: "attention",
+              items: [{
+                type: "TextBlock",
+                text: "⚠️ Needs Attention",
+                weight: "Bolder",
+                size: "Medium"
+              }, {
+                type: "TextBlock",
+                text: warnings.join('\n\n'),
+                wrap: true,
+                size: "Small"
+              }]
+            });
           }
 
-          message += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
-
-          // Adaptive Card payload for Teams Workflow (Power Automate)
-          // This format is required by "Post to a channel when a webhook request is received"
+          // ─── Build Payload ───
           const payload = JSON.stringify({
             type: "message",
             attachments: [{
@@ -203,34 +322,12 @@ jobs:
                 "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
                 type: "AdaptiveCard",
                 version: "1.4",
-                body: [
-                  {
-                    type: "TextBlock",
-                    text: "📋 Client Delivery Tracker — " + currentSprintTitle,
-                    weight: "Bolder",
-                    size: "Large",
-                    wrap: true
-                  },
-                  {
-                    type: "TextBlock",
-                    text: `📅 ${date} | Sprint: ${sprintStart} → ${endDate} | Items: ${sprintItems.length}`,
-                    spacing: "None",
-                    isSubtle: true,
-                    wrap: true
-                  },
-                  {
-                    type: "TextBlock",
-                    text: message,
-                    wrap: true,
-                    size: "Small",
-                    separator: true
-                  }
-                ]
+                body: cardBody
               }
             }]
           });
 
-          // Post to Teams Workflow webhook (Power Automate)
+          // ─── Post to Teams Workflow ───
           const webhookUrl = new URL(process.env.TEAMS_WEBHOOK_URL);
           const options = {
             hostname: webhookUrl.hostname,
@@ -248,16 +345,16 @@ jobs:
             res.on('data', (chunk) => body += chunk);
             res.on('end', () => {
               if (res.statusCode >= 200 && res.statusCode < 300) {
-                console.log('✅ Successfully posted to Teams via Workflow');
+                console.log('✅ Posted to Teams via Workflow');
               } else {
-                console.error(`❌ Teams Workflow responded with ${res.statusCode}: ${body}`);
+                console.error(`❌ Teams responded ${res.statusCode}: ${body}`);
                 process.exit(1);
               }
             });
           });
 
           req.on('error', (e) => {
-            console.error(`❌ Failed to post to Teams: ${e.message}`);
+            console.error(`❌ Failed: ${e.message}`);
             process.exit(1);
           });
 

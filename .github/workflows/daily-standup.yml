@@ -182,7 +182,7 @@ jobs:
             if (!activeStatuses.includes(status)) return false;
 
             return isCurrentSprint(item);
-          });
+          }).slice(0, 10);
 
           console.log(`Total project items fetched: ${items.length}`);
           console.log(`Current sprint active items: ${reportItems.length}`);

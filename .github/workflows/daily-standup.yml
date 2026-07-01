@@ -125,7 +125,7 @@ jobs:
           const raw = JSON.parse(fs.readFileSync('/tmp/project_data.json', 'utf8'));
           const items = raw.items || [];
 
-          const excludedStatuses = ['Backlog'];
+          const excludedStatuses = ['Backlog', 'Done'];
           const maxItemsPerCard = 16;
           const today = new Date().toISOString().split('T')[0];
 
@@ -150,7 +150,6 @@ jobs:
             'PROD',
             'Todo',
             'On Hold',
-            'Done',
             'No Status'
           ];
 
@@ -206,7 +205,7 @@ jobs:
             ...Object.keys(statusCounts).filter(status => !statusOrder.includes(status))
           ];
 
-          console.log(`Current sprint items excluding Backlog: ${reportItems.length}`);
+          console.log(`Current sprint items excluding Backlog and Done: ${reportItems.length}`);
           console.log('Status breakdown:');
           orderedStatuses.forEach(status => console.log(`- ${status}: ${statusCounts[status]}`));
 
@@ -254,15 +253,15 @@ jobs:
               {
                 type: "TextBlock",
                 text: sprintStart
-                  ? `${date}  •  ${sprintStart} → ${sprintEnd}  •  ${reportItems.length} items excluding Backlog`
-                  : `${date}  •  ${reportItems.length} items excluding Backlog`,
+                  ? `${date}  •  ${sprintStart} → ${sprintEnd}  •  ${reportItems.length} items excluding Backlog and Done`
+                  : `${date}  •  ${reportItems.length} items excluding Backlog and Done`,
                 spacing: "Small",
                 isSubtle: true,
                 wrap: true
               },
               {
                 type: "TextBlock",
-                text: summaryParts || 'No current sprint items found outside Backlog.',
+                text: summaryParts || 'No current sprint items found outside Backlog and Done.',
                 wrap: true,
                 separator: true,
                 spacing: "Medium"
@@ -307,6 +306,37 @@ jobs:
                 wrap: true
               });
 
+              body.push({
+                type: "ColumnSet",
+                spacing: "Small",
+                columns: [
+                  {
+                    type: "Column",
+                    width: "stretch",
+                    items: [{
+                      type: "TextBlock",
+                      text: "Task",
+                      weight: "Bolder",
+                      size: "Small",
+                      isSubtle: true,
+                      wrap: true
+                    }]
+                  },
+                  {
+                    type: "Column",
+                    width: "130px",
+                    items: [{
+                      type: "TextBlock",
+                      text: "Who",
+                      weight: "Bolder",
+                      size: "Small",
+                      isSubtle: true,
+                      wrap: true
+                    }]
+                  }
+                ]
+              });
+
               clientItems.forEach(item => {
                 const who = item.assignees.length > 0
                   ? item.assignees.map(cleanName).join(', ')
@@ -319,11 +349,31 @@ jobs:
                     : '';
 
                 body.push({
-                  type: "TextBlock",
-                  text: `• ${item.title.replace(/^[^\w\s]+/, '').trim()}${priorityTag} — ${who}`,
-                  size: "Small",
-                  wrap: true,
-                  spacing: "Small"
+                  type: "ColumnSet",
+                  spacing: "Small",
+                  columns: [
+                    {
+                      type: "Column",
+                      width: "stretch",
+                      items: [{
+                        type: "TextBlock",
+                        text: item.title.replace(/^[^\w\s]+/, '').trim() + priorityTag,
+                        size: "Small",
+                        wrap: true
+                      }]
+                    },
+                    {
+                      type: "Column",
+                      width: "130px",
+                      items: [{
+                        type: "TextBlock",
+                        text: who,
+                        size: "Small",
+                        isSubtle: true,
+                        wrap: true
+                      }]
+                    }
+                  ]
                 });
               });
             });
@@ -386,18 +436,42 @@ jobs:
           }
 
           async function main() {
-            await postToTeams(createPayload(buildSummaryCardBody()), 'Summary card');
-            console.log('✅ Posted summary card to Teams');
+            const statusChunks = [];
 
             for (const status of orderedStatuses) {
               const statusItems = itemsByStatus[status] || [];
               const chunks = chunkArray(statusItems, maxItemsPerCard);
 
-              for (let index = 0; index < chunks.length; index++) {
-                const body = buildStatusCardBody(status, chunks[index], index + 1, chunks.length);
-                await postToTeams(createPayload(body), `${status} card ${index + 1}/${chunks.length}`);
-                console.log(`✅ Posted ${status} card ${index + 1}/${chunks.length} to Teams`);
-              }
+              chunks.forEach(chunk => {
+                statusChunks.push({
+                  status,
+                  chunk
+                });
+              });
+            }
+
+            const totalCards = 1 + statusChunks.length;
+            let globalCardNumber = 1;
+
+            await postToTeams(createPayload(buildSummaryCardBody()), `Summary card ${globalCardNumber}/${totalCards}`);
+            console.log(`✅ Posted summary card ${globalCardNumber}/${totalCards} to Teams`);
+            globalCardNumber++;
+
+            for (const statusChunk of statusChunks) {
+              const body = buildStatusCardBody(
+                statusChunk.status,
+                statusChunk.chunk,
+                globalCardNumber,
+                totalCards
+              );
+
+              await postToTeams(
+                createPayload(body),
+                `${statusChunk.status} card ${globalCardNumber}/${totalCards}`
+              );
+
+              console.log(`✅ Posted ${statusChunk.status} card ${globalCardNumber}/${totalCards} to Teams`);
+              globalCardNumber++;
             }
           }
 

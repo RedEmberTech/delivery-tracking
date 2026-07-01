@@ -126,19 +126,18 @@ jobs:
           const items = raw.items || [];
 
           const excludedStatuses = ['Backlog', 'Done'];
-          const maxItemsPerCard = 16;
+          const maxItemsPerCard = 12;
           const today = new Date().toISOString().split('T')[0];
 
           const statusEmoji = {
-            'Done': '✅',
+            'Blocked': '🔴',
             'In Progress': '🔄',
+            'In Review': '🔍',
             'UAT': '🧪',
             'PROD': '🚀',
             'Todo': '📥',
             'On Hold': '⏸️',
-            'Blocked': '🔴',
-            'Backlog': '📋',
-            'In Review': '🔍',
+            'Pending Quote Approval': '•',
             'No Status': '⚪'
           };
 
@@ -150,6 +149,7 @@ jobs:
             'PROD',
             'Todo',
             'On Hold',
+            'Pending Quote Approval',
             'No Status'
           ];
 
@@ -168,6 +168,11 @@ jobs:
             (value || '')
               .replace(/-RedEmber|-hub/gi, '')
               .replace(/[._-]/g, ' ')
+              .trim();
+
+          const cleanTitle = value =>
+            (value || 'Untitled')
+              .replace(/^[^\w\s]+/, '')
               .trim();
 
           const reportItems = items.filter(item => {
@@ -202,46 +207,14 @@ jobs:
 
           const orderedStatuses = [
             ...statusOrder.filter(status => statusCounts[status]),
-            ...Object.keys(statusCounts).filter(status => !statusOrder.includes(status))
+            ...Object.keys(statusCounts).filter(status => !statusOrder.includes(status)).sort()
           ];
 
-          console.log(`Current sprint items excluding Backlog and Done: ${reportItems.length}`);
-          console.log('Status breakdown:');
-          orderedStatuses.forEach(status => console.log(`- ${status}: ${statusCounts[status]}`));
+          const summaryParts = orderedStatuses
+            .map(status => `${statusEmoji[status] || '•'} **${statusCounts[status]}** ${status}`)
+            .join('   ');
 
-          const itemsByStatus = {};
-          reportItems.forEach(item => {
-            const status = item.fieldValueByName?.name || 'No Status';
-            const client = item.client?.name || 'Internal';
-            const title = item.content?.title || 'Untitled';
-            const priority = item.priority?.name || '';
-            const assignees = (item.content?.assignees?.nodes || []).map(a => a.login);
-
-            if (!itemsByStatus[status]) itemsByStatus[status] = [];
-            itemsByStatus[status].push({ status, client, title, priority, assignees });
-          });
-
-          Object.values(itemsByStatus).forEach(statusItems => {
-            statusItems.sort((a, b) => {
-              const clientCompare = a.client.localeCompare(b.client);
-              if (clientCompare !== 0) return clientCompare;
-              return a.title.localeCompare(b.title);
-            });
-          });
-
-          function chunkArray(array, size) {
-            const chunks = [];
-            for (let i = 0; i < array.length; i += size) {
-              chunks.push(array.slice(i, i + size));
-            }
-            return chunks;
-          }
-
-          function buildSummaryCardBody() {
-            const summaryParts = orderedStatuses
-              .map(status => `${statusEmoji[status] || '•'} **${statusCounts[status]}** ${status}`)
-              .join('   ');
-
+          function buildHeaderBlocks(cardNumber, totalCards) {
             return [
               {
                 type: "TextBlock",
@@ -265,31 +238,89 @@ jobs:
                 wrap: true,
                 separator: true,
                 spacing: "Medium"
+              },
+              {
+                type: "TextBlock",
+                text: `Card ${cardNumber}/${totalCards}`,
+                spacing: "Small",
+                isSubtle: true,
+                wrap: true
               }
             ];
           }
 
-          function buildStatusCardBody(status, chunkItems, cardNumber, totalCards) {
-            const grouped = {};
+          const itemsByStatus = {};
+          reportItems.forEach(item => {
+            const status = item.fieldValueByName?.name || 'No Status';
+            const client = item.client?.name || 'Internal';
+            const title = item.content?.title || 'Untitled';
+            const priority = item.priority?.name || '';
+            const assignees = (item.content?.assignees?.nodes || []).map(a => a.login);
 
-            chunkItems.forEach(item => {
+            if (!itemsByStatus[status]) itemsByStatus[status] = [];
+            itemsByStatus[status].push({ status, client, title, priority, assignees });
+          });
+
+          for (const status of Object.keys(itemsByStatus)) {
+            itemsByStatus[status].sort((a, b) => {
+              const clientCompare = a.client.localeCompare(b.client);
+              if (clientCompare !== 0) return clientCompare;
+              return cleanTitle(a.title).localeCompare(cleanTitle(b.title));
+            });
+          }
+
+          function chunkArray(array, size) {
+            const chunks = [];
+            for (let i = 0; i < array.length; i += size) {
+              chunks.push(array.slice(i, i + size));
+            }
+            return chunks;
+          }
+
+          const statusCardPlan = [];
+
+          for (const status of orderedStatuses) {
+            const statusItems = itemsByStatus[status] || [];
+            const chunks = chunkArray(statusItems, maxItemsPerCard);
+
+            chunks.forEach((chunk, index) => {
+              statusCardPlan.push({
+                status,
+                chunk,
+                statusPartNumber: index + 1,
+                statusPartTotal: chunks.length
+              });
+            });
+          }
+
+          const totalCards = Math.max(1, statusCardPlan.length);
+
+          console.log(`Current sprint items excluding Backlog and Done: ${reportItems.length}`);
+          console.log(`Total Teams cards to post: ${totalCards}`);
+          console.log('Status breakdown:');
+          orderedStatuses.forEach(status => console.log(`- ${status}: ${statusCounts[status]}`));
+
+          function buildStatusCardBody(planItem, cardNumber, totalCards) {
+            const { status, chunk, statusPartNumber, statusPartTotal } = planItem;
+
+            const grouped = {};
+            chunk.forEach(item => {
               if (!grouped[item.client]) grouped[item.client] = [];
               grouped[item.client].push(item);
             });
 
             const body = [
+              ...buildHeaderBlocks(cardNumber, totalCards),
               {
                 type: "TextBlock",
-                text: `${statusEmoji[status] || '•'} ${status} — ${currentSprintTitle}`,
+                text: statusPartTotal > 1
+                  ? `${statusEmoji[status] || '•'} **${status}** (${statusCounts[status]} items) — Part ${statusPartNumber}/${statusPartTotal}`
+                  : `${statusEmoji[status] || '•'} **${status}** (${statusCounts[status]} items)`,
                 weight: "Bolder",
-                size: "Large",
-                wrap: true
-              },
-              {
-                type: "TextBlock",
-                text: `${date}  •  ${statusCounts[status]} ${status} item(s)  •  Card ${cardNumber}/${totalCards}`,
-                spacing: "Small",
-                isSubtle: true,
+                size: "Medium",
+                color: "Accent",
+                separator: true,
+                spacing: "Medium",
                 wrap: true
               }
             ];
@@ -300,7 +331,6 @@ jobs:
                 text: `**${client}**`,
                 weight: "Bolder",
                 size: "Medium",
-                color: "Accent",
                 separator: true,
                 spacing: "Medium",
                 wrap: true
@@ -357,7 +387,7 @@ jobs:
                       width: "stretch",
                       items: [{
                         type: "TextBlock",
-                        text: item.title.replace(/^[^\w\s]+/, '').trim() + priorityTag,
+                        text: cleanTitle(item.title) + priorityTag,
                         size: "Small",
                         wrap: true
                       }]
@@ -379,6 +409,12 @@ jobs:
             });
 
             return body;
+          }
+
+          function buildEmptyCardBody() {
+            return [
+              ...buildHeaderBlocks(1, 1)
+            ];
           }
 
           function createPayload(body) {
@@ -436,42 +472,23 @@ jobs:
           }
 
           async function main() {
-            const statusChunks = [];
-
-            for (const status of orderedStatuses) {
-              const statusItems = itemsByStatus[status] || [];
-              const chunks = chunkArray(statusItems, maxItemsPerCard);
-
-              chunks.forEach(chunk => {
-                statusChunks.push({
-                  status,
-                  chunk
-                });
-              });
+            if (statusCardPlan.length === 0) {
+              await postToTeams(createPayload(buildEmptyCardBody()), 'Card 1/1');
+              console.log('✅ Posted card 1/1 to Teams');
+              return;
             }
 
-            const totalCards = 1 + statusChunks.length;
-            let globalCardNumber = 1;
-
-            await postToTeams(createPayload(buildSummaryCardBody()), `Summary card ${globalCardNumber}/${totalCards}`);
-            console.log(`✅ Posted summary card ${globalCardNumber}/${totalCards} to Teams`);
-            globalCardNumber++;
-
-            for (const statusChunk of statusChunks) {
-              const body = buildStatusCardBody(
-                statusChunk.status,
-                statusChunk.chunk,
-                globalCardNumber,
-                totalCards
-              );
+            for (let index = 0; index < statusCardPlan.length; index++) {
+              const cardNumber = index + 1;
+              const planItem = statusCardPlan[index];
+              const body = buildStatusCardBody(planItem, cardNumber, totalCards);
 
               await postToTeams(
                 createPayload(body),
-                `${statusChunk.status} card ${globalCardNumber}/${totalCards}`
+                `Card ${cardNumber}/${totalCards} - ${planItem.status}`
               );
 
-              console.log(`✅ Posted ${statusChunk.status} card ${globalCardNumber}/${totalCards} to Teams`);
-              globalCardNumber++;
+              console.log(`✅ Posted card ${cardNumber}/${totalCards} - ${planItem.status} to Teams`);
             }
           }
 

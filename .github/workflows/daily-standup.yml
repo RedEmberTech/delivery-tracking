@@ -4,7 +4,7 @@ on:
   schedule:
     # 5pm SAST (UTC+2) = 15:00 UTC, Monday to Friday
     - cron: '0 15 * * 1-5'
-  workflow_dispatch: # Allow manual trigger for testing
+  workflow_dispatch:
 
 jobs:
   post-status:
@@ -12,6 +12,7 @@ jobs:
     permissions:
       contents: read
       issues: read
+      pull-requests: read
 
     steps:
       - name: Query Client Delivery Tracker
@@ -22,65 +23,72 @@ jobs:
           const fs = require('fs');
           const { execFileSync } = require('child_process');
 
-          const pageQuery = (cursor) => `
-            query {
-              organization(login: "RedEmberTech") {
-                projectV2(number: 8) {
-                  title
-                  items(first: 100${cursor ? `, after: \"${cursor}\"` : ''}) {
-                    pageInfo {
-                      hasNextPage
-                      endCursor
-                    }
-                    nodes {
-                      fieldValueByName(name: "Status") {
-                        ... on ProjectV2ItemFieldSingleSelectValue {
-                          name
-                        }
+          let allItems = [];
+          let cursor = null;
+
+          do {
+            const after = cursor ? `, after: "${cursor}"` : '';
+
+            const query = `
+              query {
+                organization(login: "RedEmberTech") {
+                  projectV2(number: 8) {
+                    title
+                    items(first: 100${after}) {
+                      pageInfo {
+                        hasNextPage
+                        endCursor
                       }
-                      sprint: fieldValueByName(name: "Sprint") {
-                        ... on ProjectV2ItemFieldIterationValue {
-                          title
-                          startDate
-                          duration
-                        }
-                      }
-                      priority: fieldValueByName(name: "Priority") {
-                        ... on ProjectV2ItemFieldSingleSelectValue {
-                          name
-                        }
-                      }
-                      client: fieldValueByName(name: "Client") {
-                        ... on ProjectV2ItemFieldSingleSelectValue {
-                          name
-                        }
-                      }
-                      content {
-                        ... on Issue {
-                          title
-                          number
-                          url
-                          assignees(first: 20) {
-                            nodes {
-                              login
-                            }
+                      nodes {
+                        fieldValueByName(name: "Status") {
+                          ... on ProjectV2ItemFieldSingleSelectValue {
+                            name
                           }
                         }
-                        ... on DraftIssue {
-                          title
-                          assignees(first: 20) {
-                            nodes {
-                              login
-                            }
+                        sprint: fieldValueByName(name: "Sprint") {
+                          ... on ProjectV2ItemFieldIterationValue {
+                            title
+                            startDate
+                            duration
                           }
                         }
-                        ... on PullRequest {
-                          title
-                          number
-                          url
-                          assignees(first: 20) {
-                            nodes {
-                              login
+                        priority: fieldValueByName(name: "Priority") {
+                          ... on ProjectV2ItemFieldSingleSelectValue {
+                            name
+                          }
+                        }
+                        client: fieldValueByName(name: "Client") {
+                          ... on ProjectV2ItemFieldSingleSelectValue {
+                            name
+                          }
+                        }
+                        content {
+                          ... on Issue {
+                            title
+                            number
+                            url
+                            assignees(first: 20) {
+                              nodes {
+                                login
+                              }
+                            }
+                          }
+                          ... on DraftIssue {
+                            title
+                            assignees(first: 20) {
+                              nodes {
+                                login
+                              }
+                            }
+                          }
+                          ... on PullRequest {
+                            title
+                            number
+                            url
+                            assignees(first: 20) {
+                              nodes {
+                                login
+                              }
                             }
                           }
                         }
@@ -89,36 +97,20 @@ jobs:
                   }
                 }
               }
-            }
-          `;
+            `;
 
-          let allItems = [];
-          let cursor = null;
-          let hasNextPage = true;
-          let projectTitle = '';
-
-          while (hasNextPage) {
-            const query = pageQuery(cursor);
             const result = JSON.parse(execFileSync('gh', ['api', 'graphql', '-f', `query=${query}`], {
               encoding: 'utf8',
               maxBuffer: 1024 * 1024 * 20
             }));
 
-            if (result.errors?.length) {
-              console.error(JSON.stringify(result.errors, null, 2));
-              process.exit(1);
-            }
-
             const project = result.data.organization.projectV2;
-            projectTitle = project.title;
             allItems.push(...project.items.nodes);
+            cursor = project.items.pageInfo.hasNextPage ? project.items.pageInfo.endCursor : null;
+          } while (cursor);
 
-            hasNextPage = project.items.pageInfo.hasNextPage;
-            cursor = project.items.pageInfo.endCursor;
-          }
-
-          console.log(`Fetched ${allItems.length} project items from ${projectTitle}`);
-          fs.writeFileSync('/tmp/project_data.json', JSON.stringify({ projectTitle, items: allItems }, null, 2));
+          console.log(`Total project items fetched: ${allItems.length}`);
+          fs.writeFileSync('/tmp/project_data.json', JSON.stringify({ items: allItems }, null, 2));
           EOF
 
       - name: Format and Post to Teams
@@ -133,16 +125,9 @@ jobs:
           const raw = JSON.parse(fs.readFileSync('/tmp/project_data.json', 'utf8'));
           const items = raw.items || [];
 
-          const activeStatuses = [
-            'Todo',
-            'In Progress',
-            'In Review',
-            'UAT',
-            'PROD',
-            'Blocked',
-            'On Hold',
-            'No Status'
-          ];
+          const excludedStatuses = ['Backlog'];
+          const maxItemsPerCard = 16;
+          const today = new Date().toISOString().split('T')[0];
 
           const statusEmoji = {
             'Done': '✅',
@@ -157,38 +142,41 @@ jobs:
             'No Status': '⚪'
           };
 
-          const today = new Date().toLocaleDateString('en-CA', {
-            timeZone: 'Africa/Johannesburg'
-          });
+          const statusOrder = [
+            'Blocked',
+            'In Progress',
+            'In Review',
+            'UAT',
+            'PROD',
+            'Todo',
+            'On Hold',
+            'Done',
+            'No Status'
+          ];
 
-          const isCurrentSprint = (item) => {
+          const isCurrentSprint = item => {
             const sprint = item.sprint;
             if (!sprint?.startDate) return false;
 
-            const sprintStart = sprint.startDate;
-            const sprintEndDate = new Date(`${sprint.startDate}T00:00:00Z`);
-            sprintEndDate.setUTCDate(sprintEndDate.getUTCDate() + (sprint.duration || 14));
-            const sprintEnd = sprintEndDate.toISOString().split('T')[0];
+            const sprintEnd = new Date(sprint.startDate);
+            sprintEnd.setDate(sprintEnd.getDate() + (sprint.duration || 14));
 
-            return sprintStart <= today && sprintEnd >= today;
+            return sprint.startDate <= today &&
+              sprintEnd.toISOString().split('T')[0] >= today;
           };
 
-          const getStatus = (item) => item.fieldValueByName?.name || 'No Status';
+          const cleanName = value =>
+            (value || '')
+              .replace(/-RedEmber|-hub/gi, '')
+              .replace(/[._-]/g, ' ')
+              .trim();
 
           const reportItems = items.filter(item => {
             if (!item.content) return false;
 
-            const status = getStatus(item);
-            if (!activeStatuses.includes(status)) return false;
+            const status = item.fieldValueByName?.name || 'No Status';
 
-            return isCurrentSprint(item);
-          }).slice(0, 10);
-
-          console.log(`Total project items fetched: ${items.length}`);
-          console.log(`Current sprint active items: ${reportItems.length}`);
-          console.log('Included items:');
-          reportItems.forEach(item => {
-            console.log(`- [${getStatus(item)}] ${item.sprint?.title || 'No Sprint'} :: ${item.content?.title || 'Untitled'}`);
+            return isCurrentSprint(item) && !excludedStatuses.includes(status);
           });
 
           const currentSprintItem = reportItems.find(item => item.sprint) || items.find(isCurrentSprint);
@@ -196,14 +184,10 @@ jobs:
           const sprintStart = currentSprintItem?.sprint?.startDate || '';
           const sprintDuration = currentSprintItem?.sprint?.duration || 14;
           const sprintEnd = sprintStart
-            ? (() => {
-                const end = new Date(`${sprintStart}T00:00:00Z`);
-                end.setUTCDate(end.getUTCDate() + sprintDuration);
-                return end.toISOString().split('T')[0];
-              })()
+            ? new Date(new Date(sprintStart).getTime() + sprintDuration * 86400000).toISOString().split('T')[0]
             : '';
 
-          const displayDate = new Date().toLocaleDateString('en-ZA', {
+          const date = new Date().toLocaleDateString('en-ZA', {
             weekday: 'long',
             year: 'numeric',
             month: 'long',
@@ -211,256 +195,214 @@ jobs:
             timeZone: 'Africa/Johannesburg'
           });
 
-          const clientGroups = {};
-          const assigneeLoad = {};
-
-          reportItems.forEach(item => {
-            const status = getStatus(item);
-            const title = item.content?.title || 'Untitled';
-            const priority = item.priority?.name || '';
-            const client = item.client?.name || 'Internal';
-            const assignees = (item.content?.assignees?.nodes || []).map(a => a.login);
-
-            if (!clientGroups[client]) clientGroups[client] = [];
-            clientGroups[client].push({ title, status, priority, assignees });
-
-            assignees.forEach(a => {
-              if (!assigneeLoad[a]) assigneeLoad[a] = { total: 0, statuses: {} };
-              assigneeLoad[a].total++;
-              assigneeLoad[a].statuses[status] = (assigneeLoad[a].statuses[status] || 0) + 1;
-            });
-          });
-
-          const clientOrder = Object.entries(clientGroups).sort((a, b) => b[1].length - a[1].length);
-
           const statusCounts = {};
           reportItems.forEach(item => {
-            const status = getStatus(item);
+            const status = item.fieldValueByName?.name || 'No Status';
             statusCounts[status] = (statusCounts[status] || 0) + 1;
           });
 
-          const statusOrder = ['In Progress', 'Blocked', 'UAT', 'PROD', 'In Review', 'Todo', 'On Hold', 'No Status'];
-          const summaryParts = statusOrder
-            .filter(status => statusCounts[status])
-            .map(status => `${statusEmoji[status] || '•'} **${statusCounts[status]}** ${status}`)
-            .join('   ');
+          const orderedStatuses = [
+            ...statusOrder.filter(status => statusCounts[status]),
+            ...Object.keys(statusCounts).filter(status => !statusOrder.includes(status))
+          ];
 
-          const cardBody = [];
+          console.log(`Current sprint items excluding Backlog: ${reportItems.length}`);
+          console.log('Status breakdown:');
+          orderedStatuses.forEach(status => console.log(`- ${status}: ${statusCounts[status]}`));
 
-          cardBody.push({
-            type: 'TextBlock',
-            text: `📋 Client Delivery Tracker — ${currentSprintTitle}`,
-            weight: 'Bolder',
-            size: 'Large',
-            wrap: true
+          const itemsByStatus = {};
+          reportItems.forEach(item => {
+            const status = item.fieldValueByName?.name || 'No Status';
+            const client = item.client?.name || 'Internal';
+            const title = item.content?.title || 'Untitled';
+            const priority = item.priority?.name || '';
+            const assignees = (item.content?.assignees?.nodes || []).map(a => a.login);
+
+            if (!itemsByStatus[status]) itemsByStatus[status] = [];
+            itemsByStatus[status].push({ status, client, title, priority, assignees });
           });
 
-          cardBody.push({
-            type: 'TextBlock',
-            text: sprintStart
-              ? `${displayDate}  •  ${sprintStart} → ${sprintEnd}  •  ${reportItems.length} active sprint items`
-              : `${displayDate}  •  ${reportItems.length} active sprint items`,
-            spacing: 'Small',
-            isSubtle: true,
-            wrap: true
+          Object.values(itemsByStatus).forEach(statusItems => {
+            statusItems.sort((a, b) => {
+              const clientCompare = a.client.localeCompare(b.client);
+              if (clientCompare !== 0) return clientCompare;
+              return a.title.localeCompare(b.title);
+            });
           });
 
-          cardBody.push({
-            type: 'TextBlock',
-            text: summaryParts || 'No active work found in the current sprint.',
-            wrap: true,
-            separator: true,
-            spacing: 'Medium'
-          });
+          function chunkArray(array, size) {
+            const chunks = [];
+            for (let i = 0; i < array.length; i += size) {
+              chunks.push(array.slice(i, i + size));
+            }
+            return chunks;
+          }
 
-          clientOrder.forEach(([client, clientItems]) => {
-            cardBody.push({
-              type: 'TextBlock',
-              text: `**${client}**`,
-              weight: 'Bolder',
-              size: 'Medium',
-              color: 'Accent',
-              separator: true,
-              spacing: 'Medium',
-              wrap: true
+          function buildSummaryCardBody() {
+            const summaryParts = orderedStatuses
+              .map(status => `${statusEmoji[status] || '•'} **${statusCounts[status]}** ${status}`)
+              .join('   ');
+
+            return [
+              {
+                type: "TextBlock",
+                text: `📋 Client Delivery Tracker — ${currentSprintTitle}`,
+                weight: "Bolder",
+                size: "Large",
+                wrap: true
+              },
+              {
+                type: "TextBlock",
+                text: sprintStart
+                  ? `${date}  •  ${sprintStart} → ${sprintEnd}  •  ${reportItems.length} items excluding Backlog`
+                  : `${date}  •  ${reportItems.length} items excluding Backlog`,
+                spacing: "Small",
+                isSubtle: true,
+                wrap: true
+              },
+              {
+                type: "TextBlock",
+                text: summaryParts || 'No current sprint items found outside Backlog.',
+                wrap: true,
+                separator: true,
+                spacing: "Medium"
+              }
+            ];
+          }
+
+          function buildStatusCardBody(status, chunkItems, cardNumber, totalCards) {
+            const grouped = {};
+
+            chunkItems.forEach(item => {
+              if (!grouped[item.client]) grouped[item.client] = [];
+              grouped[item.client].push(item);
             });
 
-            cardBody.push({
-              type: 'ColumnSet',
-              spacing: 'Small',
-              columns: [
-                {
-                  type: 'Column',
-                  width: 'stretch',
-                  items: [{ type: 'TextBlock', text: 'Task', weight: 'Bolder', size: 'Small', isSubtle: true }]
-                },
-                {
-                  type: 'Column',
-                  width: '100px',
-                  items: [{ type: 'TextBlock', text: 'Status', weight: 'Bolder', size: 'Small', isSubtle: true }]
-                },
-                {
-                  type: 'Column',
-                  width: '120px',
-                  items: [{ type: 'TextBlock', text: 'Who', weight: 'Bolder', size: 'Small', isSubtle: true }]
-                }
-              ]
-            });
+            const body = [
+              {
+                type: "TextBlock",
+                text: `${statusEmoji[status] || '•'} ${status} — ${currentSprintTitle}`,
+                weight: "Bolder",
+                size: "Large",
+                wrap: true
+              },
+              {
+                type: "TextBlock",
+                text: `${date}  •  ${statusCounts[status]} ${status} item(s)  •  Card ${cardNumber}/${totalCards}`,
+                spacing: "Small",
+                isSubtle: true,
+                wrap: true
+              }
+            ];
 
-            clientItems.forEach(item => {
-              const emoji = statusEmoji[item.status] || '•';
-              const who = item.assignees.length > 0
-                ? item.assignees.map(a => a.replace(/-RedEmber|-hub/gi, '')).join(', ')
-                : 'Unassigned';
+            Object.entries(grouped).forEach(([client, clientItems]) => {
+              body.push({
+                type: "TextBlock",
+                text: `**${client}**`,
+                weight: "Bolder",
+                size: "Medium",
+                color: "Accent",
+                separator: true,
+                spacing: "Medium",
+                wrap: true
+              });
 
-              const priorityTag = item.priority.includes('P1')
-                ? ' 🔴'
-                : item.priority.includes('P2')
-                  ? ' 🟡'
-                  : '';
+              clientItems.forEach(item => {
+                const who = item.assignees.length > 0
+                  ? item.assignees.map(cleanName).join(', ')
+                  : 'Unassigned';
 
-              cardBody.push({
-                type: 'ColumnSet',
-                spacing: 'Small',
-                columns: [
-                  {
-                    type: 'Column',
-                    width: 'stretch',
-                    items: [{
-                      type: 'TextBlock',
-                      text: item.title.replace(/^[^\w\s]+/, '').trim() + priorityTag,
-                      size: 'Small',
-                      wrap: true
-                    }]
-                  },
-                  {
-                    type: 'Column',
-                    width: '100px',
-                    items: [{
-                      type: 'TextBlock',
-                      text: `${emoji} ${item.status}`,
-                      size: 'Small',
-                      wrap: true
-                    }]
-                  },
-                  {
-                    type: 'Column',
-                    width: '120px',
-                    items: [{
-                      type: 'TextBlock',
-                      text: who,
-                      size: 'Small',
-                      isSubtle: true,
-                      wrap: true
-                    }]
-                  }
-                ]
+                const priorityTag = item.priority.includes('P1')
+                  ? ' 🔴'
+                  : item.priority.includes('P2')
+                    ? ' 🟡'
+                    : '';
+
+                body.push({
+                  type: "TextBlock",
+                  text: `• ${item.title.replace(/^[^\w\s]+/, '').trim()}${priorityTag} — ${who}`,
+                  size: "Small",
+                  wrap: true,
+                  spacing: "Small"
+                });
               });
             });
-          });
 
-          cardBody.push({
-            type: 'TextBlock',
-            text: '👥 Team Load',
-            weight: 'Bolder',
-            size: 'Medium',
-            separator: true,
-            spacing: 'Medium'
-          });
+            return body;
+          }
 
-          const teamFacts = Object.entries(assigneeLoad)
-            .sort((a, b) => b[1].total - a[1].total)
-            .map(([name, data]) => {
-              const shortName = name.replace(/-RedEmber|-hub/gi, '');
-              const breakdown = Object.entries(data.statuses)
-                .map(([status, count]) => `${statusEmoji[status] || ''} ${count} ${status}`)
-                .join('  ');
-
-              return {
-                title: shortName,
-                value: `${data.total} items — ${breakdown}`
-              };
-            });
-
-          cardBody.push({
-            type: 'FactSet',
-            facts: teamFacts.length > 0
-              ? teamFacts
-              : [{ title: 'No assignees', value: 'No active assigned work found in the current sprint.' }],
-            spacing: 'Small'
-          });
-
-          const critical = reportItems.filter(item =>
-            (item.priority?.name || '').includes('P1') && getStatus(item) !== 'Done'
-          );
-          const blocked = reportItems.filter(item => getStatus(item) === 'Blocked');
-          const onHold = reportItems.filter(item => getStatus(item) === 'On Hold');
-
-          if (critical.length || blocked.length || onHold.length) {
-            const warnings = [
-              critical.length && `🔴 ${critical.length}x P1 Critical still active`,
-              blocked.length && `🚫 ${blocked.length} Blocked — needs unblocking`,
-              onHold.length && `⏸️ ${onHold.length} On Hold — needs decisions`
-            ].filter(Boolean).join('   ');
-
-            cardBody.push({
-              type: 'Container',
-              style: 'attention',
-              separator: true,
-              spacing: 'Medium',
-              items: [{
-                type: 'TextBlock',
-                text: `⚠️  ${warnings}`,
-                wrap: true,
-                size: 'Small'
+          function createPayload(body) {
+            return JSON.stringify({
+              type: "message",
+              attachments: [{
+                contentType: "application/vnd.microsoft.card.adaptive",
+                contentUrl: null,
+                content: {
+                  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                  type: "AdaptiveCard",
+                  version: "1.4",
+                  body
+                }
               }]
             });
           }
 
-          const payload = JSON.stringify({
-            type: 'message',
-            attachments: [{
-              contentType: 'application/vnd.microsoft.card.adaptive',
-              contentUrl: null,
-              content: {
-                '$schema': 'http://adaptivecards.io/schemas/adaptive-card.json',
-                type: 'AdaptiveCard',
-                version: '1.4',
-                body: cardBody
-              }
-            }]
-          });
+          function postToTeams(payload, label) {
+            return new Promise((resolve, reject) => {
+              const webhookUrl = new URL(process.env.TEAMS_WEBHOOK_URL);
 
-          const webhookUrl = new URL(process.env.TEAMS_WEBHOOK_URL);
-          const options = {
-            hostname: webhookUrl.hostname,
-            port: webhookUrl.port || 443,
-            path: webhookUrl.pathname + webhookUrl.search,
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Content-Length': Buffer.byteLength(payload)
-            }
-          };
+              const options = {
+                hostname: webhookUrl.hostname,
+                port: webhookUrl.port || 443,
+                path: webhookUrl.pathname + webhookUrl.search,
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Content-Length': Buffer.byteLength(payload)
+                }
+              };
 
-          const req = https.request(options, (res) => {
-            let body = '';
-            res.on('data', chunk => body += chunk);
-            res.on('end', () => {
-              if (res.statusCode >= 200 && res.statusCode < 300) {
-                console.log('✅ Posted to Teams');
-              } else {
-                console.error(`❌ Teams responded ${res.statusCode}: ${body}`);
-                process.exit(1);
-              }
+              const req = https.request(options, (res) => {
+                let body = '';
+
+                res.on('data', chunk => body += chunk);
+
+                res.on('end', () => {
+                  console.log(`${label} Teams status: ${res.statusCode}`);
+                  console.log(`${label} Teams response: ${body || '(empty)'}`);
+
+                  if (res.statusCode >= 200 && res.statusCode < 300) {
+                    resolve();
+                  } else {
+                    reject(new Error(`Teams responded ${res.statusCode}: ${body}`));
+                  }
+                });
+              });
+
+              req.on('error', reject);
+              req.write(payload);
+              req.end();
             });
-          });
+          }
 
-          req.on('error', e => {
-            console.error(`❌ ${e.message}`);
+          async function main() {
+            await postToTeams(createPayload(buildSummaryCardBody()), 'Summary card');
+            console.log('✅ Posted summary card to Teams');
+
+            for (const status of orderedStatuses) {
+              const statusItems = itemsByStatus[status] || [];
+              const chunks = chunkArray(statusItems, maxItemsPerCard);
+
+              for (let index = 0; index < chunks.length; index++) {
+                const body = buildStatusCardBody(status, chunks[index], index + 1, chunks.length);
+                await postToTeams(createPayload(body), `${status} card ${index + 1}/${chunks.length}`);
+                console.log(`✅ Posted ${status} card ${index + 1}/${chunks.length} to Teams`);
+              }
+            }
+          }
+
+          main().catch(error => {
+            console.error(`❌ ${error.message}`);
             process.exit(1);
           });
-
-          req.write(payload);
-          req.end();
           EOF

@@ -20,7 +20,7 @@ jobs:
         run: |
           node << 'EOF'
           const fs = require('fs');
-          const { execSync } = require('child_process');
+          const { execFileSync } = require('child_process');
 
           const pageQuery = (cursor) => `
             query {
@@ -99,7 +99,7 @@ jobs:
 
           while (hasNextPage) {
             const query = pageQuery(cursor);
-            const result = JSON.parse(execSync(`gh api graphql -f query=${JSON.stringify(query)}`, {
+            const result = JSON.parse(execFileSync('gh', ['api', 'graphql', '-f', `query=${query}`], {
               encoding: 'utf8',
               maxBuffer: 1024 * 1024 * 20
             }));

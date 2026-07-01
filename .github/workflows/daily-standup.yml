@@ -15,17 +15,23 @@ jobs:
 
     steps:
       - name: Query Client Delivery Tracker
-        id: query
         env:
           GH_TOKEN: ${{ secrets.PROJECT_READ_TOKEN }}
         run: |
-          # Get the current active sprint iteration and all items from Project #8
-          RESULT=$(gh api graphql -f query='
+          node << 'EOF'
+          const fs = require('fs');
+          const { execSync } = require('child_process');
+
+          const pageQuery = (cursor) => `
             query {
               organization(login: "RedEmberTech") {
                 projectV2(number: 8) {
                   title
-                  items(first: 100) {
+                  items(first: 100${cursor ? `, after: \"${cursor}\"` : ''}) {
+                    pageInfo {
+                      hasNextPage
+                      endCursor
+                    }
                     nodes {
                       fieldValueByName(name: "Status") {
                         ... on ProjectV2ItemFieldSingleSelectValue {
@@ -54,7 +60,25 @@ jobs:
                           title
                           number
                           url
-                          assignees(first: 5) {
+                          assignees(first: 20) {
+                            nodes {
+                              login
+                            }
+                          }
+                        }
+                        ... on DraftIssue {
+                          title
+                          assignees(first: 20) {
+                            nodes {
+                              login
+                            }
+                          }
+                        }
+                        ... on PullRequest {
+                          title
+                          number
+                          url
+                          assignees(first: 20) {
                             nodes {
                               login
                             }
@@ -66,8 +90,36 @@ jobs:
                 }
               }
             }
-          ')
-          echo "$RESULT" > /tmp/project_data.json
+          `;
+
+          let allItems = [];
+          let cursor = null;
+          let hasNextPage = true;
+          let projectTitle = '';
+
+          while (hasNextPage) {
+            const query = pageQuery(cursor);
+            const result = JSON.parse(execSync(`gh api graphql -f query=${JSON.stringify(query)}`, {
+              encoding: 'utf8',
+              maxBuffer: 1024 * 1024 * 20
+            }));
+
+            if (result.errors?.length) {
+              console.error(JSON.stringify(result.errors, null, 2));
+              process.exit(1);
+            }
+
+            const project = result.data.organization.projectV2;
+            projectTitle = project.title;
+            allItems.push(...project.items.nodes);
+
+            hasNextPage = project.items.pageInfo.hasNextPage;
+            cursor = project.items.pageInfo.endCursor;
+          }
+
+          console.log(`Fetched ${allItems.length} project items from ${projectTitle}`);
+          fs.writeFileSync('/tmp/project_data.json', JSON.stringify({ projectTitle, items: allItems }, null, 2));
+          EOF
 
       - name: Format and Post to Teams
         env:
@@ -79,46 +131,94 @@ jobs:
           const { URL } = require('url');
 
           const raw = JSON.parse(fs.readFileSync('/tmp/project_data.json', 'utf8'));
-          const items = raw.data.organization.projectV2.items.nodes;
+          const items = raw.items || [];
 
-          // ─── Helpers ───
+          const activeStatuses = [
+            'Todo',
+            'In Progress',
+            'In Review',
+            'UAT',
+            'PROD',
+            'Blocked',
+            'On Hold',
+            'No Status'
+          ];
 
-          const today = new Date().toISOString().split('T')[0];
-          const sprintItems = items.filter(item => {
-            const sprint = item.sprint;
-            if (!sprint) return false;
-            const start = sprint.startDate;
-            const end = new Date(start);
-            end.setDate(end.getDate() + (sprint.duration || 14));
-            return start <= today && end.toISOString().split('T')[0] >= today;
-          });
+          const statusEmoji = {
+            'Done': '✅',
+            'In Progress': '🔄',
+            'UAT': '🧪',
+            'PROD': '🚀',
+            'Todo': '📥',
+            'On Hold': '⏸️',
+            'Blocked': '🔴',
+            'Backlog': '📋',
+            'In Review': '🔍',
+            'No Status': '⚪'
+          };
 
-          const currentSprintTitle = sprintItems[0]?.sprint.title || 'Current Sprint';
-          const sprintStart = sprintItems[0]?.sprint.startDate || '';
-          const sprintDuration = sprintItems[0]?.sprint.duration || 14;
-          const sprintEnd = sprintStart
-            ? new Date(new Date(sprintStart).getTime() + sprintDuration * 86400000).toISOString().split('T')[0]
-            : '';
-
-          const date = new Date().toLocaleDateString('en-ZA', {
-            weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+          const today = new Date().toLocaleDateString('en-CA', {
             timeZone: 'Africa/Johannesburg'
           });
 
-          const statusEmoji = {
-            'Done': '✅', 'In Progress': '🔄', 'UAT': '🧪', 'PROD': '🚀',
-            'Todo': '📥', 'On Hold': '⏸️', 'Blocked': '🔴', 'Backlog': '📋', 'In Review': '🔍'
+          const isCurrentSprint = (item) => {
+            const sprint = item.sprint;
+            if (!sprint?.startDate) return false;
+
+            const sprintStart = sprint.startDate;
+            const sprintEndDate = new Date(`${sprint.startDate}T00:00:00Z`);
+            sprintEndDate.setUTCDate(sprintEndDate.getUTCDate() + (sprint.duration || 14));
+            const sprintEnd = sprintEndDate.toISOString().split('T')[0];
+
+            return sprintStart <= today && sprintEnd >= today;
           };
 
-          // ─── Group by Client ───
+          const getStatus = (item) => item.fieldValueByName?.name || 'No Status';
+
+          const reportItems = items.filter(item => {
+            if (!item.content) return false;
+
+            const status = getStatus(item);
+            if (!activeStatuses.includes(status)) return false;
+
+            return isCurrentSprint(item);
+          });
+
+          console.log(`Total project items fetched: ${items.length}`);
+          console.log(`Current sprint active items: ${reportItems.length}`);
+          console.log('Included items:');
+          reportItems.forEach(item => {
+            console.log(`- [${getStatus(item)}] ${item.sprint?.title || 'No Sprint'} :: ${item.content?.title || 'Untitled'}`);
+          });
+
+          const currentSprintItem = reportItems.find(item => item.sprint) || items.find(isCurrentSprint);
+          const currentSprintTitle = currentSprintItem?.sprint?.title || 'Current Sprint';
+          const sprintStart = currentSprintItem?.sprint?.startDate || '';
+          const sprintDuration = currentSprintItem?.sprint?.duration || 14;
+          const sprintEnd = sprintStart
+            ? (() => {
+                const end = new Date(`${sprintStart}T00:00:00Z`);
+                end.setUTCDate(end.getUTCDate() + sprintDuration);
+                return end.toISOString().split('T')[0];
+              })()
+            : '';
+
+          const displayDate = new Date().toLocaleDateString('en-ZA', {
+            weekday: 'long',
+            year: 'numeric',
+            month: 'long',
+            day: 'numeric',
+            timeZone: 'Africa/Johannesburg'
+          });
+
           const clientGroups = {};
           const assigneeLoad = {};
 
-          sprintItems.forEach(item => {
-            const status  = item.fieldValueByName?.name || 'No Status';
-            const title   = item.content?.title || 'Untitled';
+          reportItems.forEach(item => {
+            const status = getStatus(item);
+            const title = item.content?.title || 'Untitled';
             const priority = item.priority?.name || '';
-            const client  = item.client?.name || 'Internal';
+            const client = item.client?.name || 'Internal';
             const assignees = (item.content?.assignees?.nodes || []).map(a => a.login);
 
             if (!clientGroups[client]) clientGroups[client] = [];
@@ -131,124 +231,125 @@ jobs:
             });
           });
 
-          // Sort clients — most active first
-          const clientOrder = Object.entries(clientGroups).sort((a, b) => {
-            const score = items => items.filter(i => !['Done','Backlog'].includes(i.status)).length;
-            return score(b[1]) - score(a[1]);
-          });
+          const clientOrder = Object.entries(clientGroups).sort((a, b) => b[1].length - a[1].length);
 
-          // ─── Status summary counts ───
           const statusCounts = {};
-          sprintItems.forEach(i => {
-            const s = i.fieldValueByName?.name || 'No Status';
-            statusCounts[s] = (statusCounts[s] || 0) + 1;
+          reportItems.forEach(item => {
+            const status = getStatus(item);
+            statusCounts[status] = (statusCounts[status] || 0) + 1;
           });
 
-          const statusOrder = ['In Progress','Blocked','UAT','PROD','In Review','Todo','On Hold','Backlog','Done'];
+          const statusOrder = ['In Progress', 'Blocked', 'UAT', 'PROD', 'In Review', 'Todo', 'On Hold', 'No Status'];
           const summaryParts = statusOrder
-            .filter(s => statusCounts[s])
-            .map(s => `${statusEmoji[s]} **${statusCounts[s]}** ${s}`)
+            .filter(status => statusCounts[status])
+            .map(status => `${statusEmoji[status] || '•'} **${statusCounts[status]}** ${status}`)
             .join('   ');
 
-          // ─── Build Card Body ───
           const cardBody = [];
 
-          // Title
           cardBody.push({
-            type: "TextBlock",
+            type: 'TextBlock',
             text: `📋 Client Delivery Tracker — ${currentSprintTitle}`,
-            weight: "Bolder",
-            size: "Large",
+            weight: 'Bolder',
+            size: 'Large',
             wrap: true
           });
 
           cardBody.push({
-            type: "TextBlock",
-            text: `${date}  •  ${sprintStart} → ${sprintEnd}  •  ${sprintItems.length} items`,
-            spacing: "Small",
+            type: 'TextBlock',
+            text: sprintStart
+              ? `${displayDate}  •  ${sprintStart} → ${sprintEnd}  •  ${reportItems.length} active sprint items`
+              : `${displayDate}  •  ${reportItems.length} active sprint items`,
+            spacing: 'Small',
             isSubtle: true,
             wrap: true
           });
 
-          // Status summary bar
           cardBody.push({
-            type: "TextBlock",
-            text: summaryParts,
+            type: 'TextBlock',
+            text: summaryParts || 'No active work found in the current sprint.',
             wrap: true,
             separator: true,
-            spacing: "Medium"
+            spacing: 'Medium'
           });
 
-          // ─── Per-Client Table ───
           clientOrder.forEach(([client, clientItems]) => {
-            // Client name as bold header
             cardBody.push({
-              type: "TextBlock",
+              type: 'TextBlock',
               text: `**${client}**`,
-              weight: "Bolder",
-              size: "Medium",
-              color: "Accent",
+              weight: 'Bolder',
+              size: 'Medium',
+              color: 'Accent',
               separator: true,
-              spacing: "Medium",
+              spacing: 'Medium',
               wrap: true
             });
 
-            // Column header row
             cardBody.push({
-              type: "ColumnSet",
-              spacing: "Small",
+              type: 'ColumnSet',
+              spacing: 'Small',
               columns: [
-                { type: "Column", width: "stretch",
-                  items: [{ type: "TextBlock", text: "Task", weight: "Bolder", size: "Small", isSubtle: true }]
+                {
+                  type: 'Column',
+                  width: 'stretch',
+                  items: [{ type: 'TextBlock', text: 'Task', weight: 'Bolder', size: 'Small', isSubtle: true }]
                 },
-                { type: "Column", width: "100px",
-                  items: [{ type: "TextBlock", text: "Status", weight: "Bolder", size: "Small", isSubtle: true }]
+                {
+                  type: 'Column',
+                  width: '100px',
+                  items: [{ type: 'TextBlock', text: 'Status', weight: 'Bolder', size: 'Small', isSubtle: true }]
                 },
-                { type: "Column", width: "120px",
-                  items: [{ type: "TextBlock", text: "Who", weight: "Bolder", size: "Small", isSubtle: true }]
+                {
+                  type: 'Column',
+                  width: '120px',
+                  items: [{ type: 'TextBlock', text: 'Who', weight: 'Bolder', size: 'Small', isSubtle: true }]
                 }
               ]
             });
 
-            // One row per task
             clientItems.forEach(item => {
               const emoji = statusEmoji[item.status] || '•';
               const who = item.assignees.length > 0
                 ? item.assignees.map(a => a.replace(/-RedEmber|-hub/gi, '')).join(', ')
                 : 'Unassigned';
-              const priorityTag = item.priority.includes('P1') ? ' 🔴' : item.priority.includes('P2') ? ' 🟡' : '';
+
+              const priorityTag = item.priority.includes('P1')
+                ? ' 🔴'
+                : item.priority.includes('P2')
+                  ? ' 🟡'
+                  : '';
 
               cardBody.push({
-                type: "ColumnSet",
-                spacing: "Small",
+                type: 'ColumnSet',
+                spacing: 'Small',
                 columns: [
                   {
-                    type: "Column",
-                    width: "stretch",
+                    type: 'Column',
+                    width: 'stretch',
                     items: [{
-                      type: "TextBlock",
+                      type: 'TextBlock',
                       text: item.title.replace(/^[^\w\s]+/, '').trim() + priorityTag,
-                      size: "Small",
+                      size: 'Small',
                       wrap: true
                     }]
                   },
                   {
-                    type: "Column",
-                    width: "100px",
+                    type: 'Column',
+                    width: '100px',
                     items: [{
-                      type: "TextBlock",
+                      type: 'TextBlock',
                       text: `${emoji} ${item.status}`,
-                      size: "Small",
+                      size: 'Small',
                       wrap: true
                     }]
                   },
                   {
-                    type: "Column",
-                    width: "120px",
+                    type: 'Column',
+                    width: '120px',
                     items: [{
-                      type: "TextBlock",
+                      type: 'TextBlock',
                       text: who,
-                      size: "Small",
+                      size: 'Small',
                       isSubtle: true,
                       wrap: true
                     }]
@@ -258,14 +359,13 @@ jobs:
             });
           });
 
-          // ─── Team Load ───
           cardBody.push({
-            type: "TextBlock",
-            text: "👥 Team Load",
-            weight: "Bolder",
-            size: "Medium",
+            type: 'TextBlock',
+            text: '👥 Team Load',
+            weight: 'Bolder',
+            size: 'Medium',
             separator: true,
-            spacing: "Medium"
+            spacing: 'Medium'
           });
 
           const teamFacts = Object.entries(assigneeLoad)
@@ -273,51 +373,64 @@ jobs:
             .map(([name, data]) => {
               const shortName = name.replace(/-RedEmber|-hub/gi, '');
               const breakdown = Object.entries(data.statuses)
-                .map(([s, c]) => `${statusEmoji[s] || ''} ${c} ${s}`).join('  ');
-              return { title: shortName, value: `${data.total} items — ${breakdown}` };
+                .map(([status, count]) => `${statusEmoji[status] || ''} ${count} ${status}`)
+                .join('  ');
+
+              return {
+                title: shortName,
+                value: `${data.total} items — ${breakdown}`
+              };
             });
 
-          cardBody.push({ type: "FactSet", facts: teamFacts, spacing: "Small" });
+          cardBody.push({
+            type: 'FactSet',
+            facts: teamFacts.length > 0
+              ? teamFacts
+              : [{ title: 'No assignees', value: 'No active assigned work found in the current sprint.' }],
+            spacing: 'Small'
+          });
 
-          // ─── Attention Banner ───
-          const critical = sprintItems.filter(i =>
-            (i.priority?.name || '').includes('P1') && i.fieldValueByName?.name !== 'Done'
+          const critical = reportItems.filter(item =>
+            (item.priority?.name || '').includes('P1') && getStatus(item) !== 'Done'
           );
-          const blocked = sprintItems.filter(i => i.fieldValueByName?.name === 'Blocked');
-          const onHold  = sprintItems.filter(i => i.fieldValueByName?.name === 'On Hold');
+          const blocked = reportItems.filter(item => getStatus(item) === 'Blocked');
+          const onHold = reportItems.filter(item => getStatus(item) === 'On Hold');
 
           if (critical.length || blocked.length || onHold.length) {
             const warnings = [
               critical.length && `🔴 ${critical.length}x P1 Critical still active`,
-              blocked.length  && `🚫 ${blocked.length} Blocked — needs unblocking`,
-              onHold.length   && `⏸️ ${onHold.length} On Hold — needs decisions`
+              blocked.length && `🚫 ${blocked.length} Blocked — needs unblocking`,
+              onHold.length && `⏸️ ${onHold.length} On Hold — needs decisions`
             ].filter(Boolean).join('   ');
 
             cardBody.push({
-              type: "Container",
-              style: "attention",
+              type: 'Container',
+              style: 'attention',
               separator: true,
-              spacing: "Medium",
-              items: [{ type: "TextBlock", text: `⚠️  ${warnings}`, wrap: true, size: "Small" }]
+              spacing: 'Medium',
+              items: [{
+                type: 'TextBlock',
+                text: `⚠️  ${warnings}`,
+                wrap: true,
+                size: 'Small'
+              }]
             });
           }
 
-          // ─── Payload ───
           const payload = JSON.stringify({
-            type: "message",
+            type: 'message',
             attachments: [{
-              contentType: "application/vnd.microsoft.card.adaptive",
+              contentType: 'application/vnd.microsoft.card.adaptive',
               contentUrl: null,
               content: {
-                "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-                type: "AdaptiveCard",
-                version: "1.4",
+                '$schema': 'http://adaptivecards.io/schemas/adaptive-card.json',
+                type: 'AdaptiveCard',
+                version: '1.4',
                 body: cardBody
               }
             }]
           });
 
-          // ─── Post to Teams Workflow ───
           const webhookUrl = new URL(process.env.TEAMS_WEBHOOK_URL);
           const options = {
             hostname: webhookUrl.hostname,
@@ -343,7 +456,11 @@ jobs:
             });
           });
 
-          req.on('error', e => { console.error(`❌ ${e.message}`); process.exit(1); });
+          req.on('error', e => {
+            console.error(`❌ ${e.message}`);
+            process.exit(1);
+          });
+
           req.write(payload);
           req.end();
           EOF

@@ -245,6 +245,10 @@ jobs:
             return chunks;
           }
 
+          function delay(ms) {
+            return new Promise(resolve => setTimeout(resolve, ms));
+          }
+
           // Build the entire post plan before sending anything.
           // This makes card counts accurate and keeps each status grouped together.
           const statusCardPlan = [];
@@ -280,7 +284,7 @@ jobs:
             return [
               {
                 type: "TextBlock",
-                text: `📋 Client Delivery Tracker — ${currentSprintTitle}`,
+                text: `Card 1/${totalCards} — 📋 Client Delivery Tracker — ${currentSprintTitle}`,
                 weight: "Bolder",
                 size: "Large",
                 wrap: true
@@ -320,7 +324,7 @@ jobs:
             const body = [
               {
                 type: "TextBlock",
-                text: statusTitle,
+                text: `Card ${globalCardNumber}/${totalCards} — ${statusTitle}`,
                 weight: "Bolder",
                 size: "Large",
                 wrap: true
@@ -483,6 +487,10 @@ jobs:
 
             console.log(`✅ Posted card 1/${totalCards} - Summary to Teams`);
 
+            // Teams Workflow webhooks can accept the HTTP request before the card is actually rendered.
+            // This pause helps Teams display cards in the same order that GitHub sends them.
+            await delay(3500);
+
             for (let index = 0; index < statusCardPlan.length; index++) {
               const globalCardNumber = index + 2;
               const planItem = statusCardPlan[index];
@@ -493,6 +501,10 @@ jobs:
               );
 
               console.log(`✅ Posted card ${globalCardNumber}/${totalCards} - ${planItem.status} part ${planItem.statusPartNumber}/${planItem.statusPartTotal} to Teams`);
+
+              if (index < statusCardPlan.length - 1) {
+                await delay(3500);
+              }
             }
           }
 
